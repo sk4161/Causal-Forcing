@@ -30,6 +30,10 @@ parser.add_argument("--num_output_frames", type=int, default=21, help="Number of
 parser.add_argument("--use_ema", action="store_true", help="Whether to use EMA parameters")
 parser.add_argument("--seed", type=int, default=0, help="Random seed")
 parser.add_argument("--i2v", action="store_true", help="Whether to perform I2V (or T2V by default)")
+parser.add_argument("--first_frame_seed", type=int, default=None,
+                    help="If set, generate 1st frame via T2V with this seed, then generate remaining frames with --seed for motion diversity")
+parser.add_argument("--num_motion_samples", type=int, default=1,
+                    help="Number of motion variations to generate per first frame (used with --first_frame_seed)")
 args = parser.parse_args()
 
 # Initialize distributed inference
@@ -136,10 +140,6 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     elif isinstance(batch_data, list):
         batch = batch_data[0]  # First (and only) item in the batch
 
-    all_video = []
-    num_generated_frames = 0  # Number of generated (latent) frames
-    
-    
     if args.i2v:
         assert config.num_frame_per_block == 1, "Current I2V only supports the frame-wise model."
         # For image-to-video, batch contains image and caption
@@ -153,47 +153,94 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
 
         # Encode the input image as the first latent
         initial_latent = pipeline.vae.encode_to_latent(image).to(device=device, dtype=torch.bfloat16)
-        prompts = [prompt] 
+        prompts = [prompt]
         sampled_noise = torch.randn(
             [1, args.num_output_frames - 1, 16, 60, 104], device=device, dtype=torch.bfloat16
         )
+
+        # Generate video
+        video, latents = pipeline.inference(
+            noise=sampled_noise,
+            text_prompts=prompts,
+            return_latents=True,
+            initial_latent=initial_latent
+        )
+        video = 255.0 * rearrange(video, 'b t c h w -> b t h w c').cpu()
+        pipeline.vae.model.clear_cache()
+        write_video(output_path, video[0], fps=16)
+
+    elif args.first_frame_seed is not None:
+        # Two-phase generation: fixed 1st frame + diverse motion
+        assert config.num_frame_per_block == 1, "first_frame_seed mode only supports the frame-wise model."
+        prompt = batch['prompts'][0]
+        extended_prompt = batch['extended_prompts'][0] if 'extended_prompts' in batch else None
+        prompts = [extended_prompt] if extended_prompt is not None else [prompt]
+
+        # Phase 1: Generate 1st frame with fixed seed
+        set_seed(args.first_frame_seed)
+        first_frame_noise = torch.randn(
+            [1, 1, 16, 60, 104], device=device, dtype=torch.bfloat16
+        )
+        first_frame_video, first_frame_latent = pipeline.inference(
+            noise=first_frame_noise,
+            text_prompts=prompts,
+            return_latents=True,
+            initial_latent=None
+        )
+        # first_frame_latent shape: [1, 1, 16, 60, 104]
+        print(f"1st frame generated with seed={args.first_frame_seed}")
+
+        # Phase 2: Generate remaining frames with different seeds
+        for motion_idx in range(args.num_motion_samples):
+            motion_seed = args.seed + motion_idx
+            output_path = os.path.join(
+                args.output_folder,
+                f'{prompt[:100]}_ff{args.first_frame_seed}_m{motion_seed}.mp4'
+            )
+            if os.path.exists(output_path):
+                print(f'Video {output_path} already exists. Pass!')
+                continue
+
+            set_seed(motion_seed)
+            motion_noise = torch.randn(
+                [1, args.num_output_frames - 1, 16, 60, 104], device=device, dtype=torch.bfloat16
+            )
+
+            video, latents = pipeline.inference(
+                noise=motion_noise,
+                text_prompts=prompts,
+                return_latents=True,
+                initial_latent=first_frame_latent
+            )
+            video = 255.0 * rearrange(video, 'b t c h w -> b t h w c').cpu()
+            pipeline.vae.model.clear_cache()
+            write_video(output_path, video[0], fps=16)
+            print(f"Saved motion variant {motion_idx} (seed={motion_seed})")
+
     else:
-        # For text-to-video, batch is just the text prompt
+        # Standard T2V
         prompt = batch['prompts'][0]
         output_path = os.path.join(args.output_folder, f'{prompt[:100]}.mp4')
         if os.path.exists(output_path):
             print('Video has been generated. Pass!')
             continue
         extended_prompt = batch['extended_prompts'][0] if 'extended_prompts' in batch else None
-        if extended_prompt is not None:
-            prompts = [extended_prompt] 
-        else:
-            prompts = [prompt] 
+        prompts = [extended_prompt] if extended_prompt is not None else [prompt]
 
         initial_latent = None
         sampled_noise = torch.randn(
             [1, args.num_output_frames, 16, 60, 104], device=device, dtype=torch.bfloat16
         )
 
-    # Generate 81 frames
-    video, latents = pipeline.inference(
-        noise=sampled_noise,
-        text_prompts=prompts,
-        return_latents=True,
-        initial_latent=initial_latent
-    )
-    current_video = rearrange(video, 'b t c h w -> b t h w c').cpu()
-    all_video.append(current_video)
-    num_generated_frames += latents.shape[1]
-
-    # Final output video
-    clean_latent = latents[0].cpu() 
-    video = 255.0 * torch.cat(all_video, dim=1)
-
-    # Clear VAE cache
-    pipeline.vae.model.clear_cache()
-
-    output_path = os.path.join(args.output_folder, f'{prompt[:100]}.mp4')
-    write_video(output_path, video[0], fps=16)
+        # Generate video
+        video, latents = pipeline.inference(
+            noise=sampled_noise,
+            text_prompts=prompts,
+            return_latents=True,
+            initial_latent=initial_latent
+        )
+        video = 255.0 * rearrange(video, 'b t c h w -> b t h w c').cpu()
+        pipeline.vae.model.clear_cache()
+        write_video(output_path, video[0], fps=16)
 
        
