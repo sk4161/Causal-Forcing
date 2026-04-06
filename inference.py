@@ -29,6 +29,7 @@ parser.add_argument("--output_folder", type=str, help="Output folder")
 parser.add_argument("--num_output_frames", type=int, default=21, help="Number of overlap frames between sliding windows")
 parser.add_argument("--use_ema", action="store_true", help="Whether to use EMA parameters")
 parser.add_argument("--seed", type=int, default=0, help="Random seed")
+parser.add_argument("--num_samples", type=int, default=1, help="Number of videos to generate per prompt (each with seed, seed+1, ...)")
 parser.add_argument("--i2v", action="store_true", help="Whether to perform I2V (or T2V by default)")
 parser.add_argument("--first_frame_seed", type=int, default=None,
                     help="If set, generate 1st frame via T2V with this seed, then generate remaining frames with --seed for motion diversity")
@@ -220,27 +221,30 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     else:
         # Standard T2V
         prompt = batch['prompts'][0]
-        output_path = os.path.join(args.output_folder, f'{prompt[:100]}.mp4')
-        if os.path.exists(output_path):
-            print('Video has been generated. Pass!')
-            continue
         extended_prompt = batch['extended_prompts'][0] if 'extended_prompts' in batch else None
         prompts = [extended_prompt] if extended_prompt is not None else [prompt]
 
-        initial_latent = None
-        sampled_noise = torch.randn(
-            [1, args.num_output_frames, 16, 60, 104], device=device, dtype=torch.bfloat16
-        )
+        for sample_idx in range(args.num_samples):
+            sample_seed = args.seed + sample_idx
+            output_path = os.path.join(args.output_folder, f'{prompt[:100]}_s{sample_seed}.mp4')
+            if os.path.exists(output_path):
+                print(f'Video {output_path} already exists. Pass!')
+                continue
 
-        # Generate video
-        video, latents = pipeline.inference(
-            noise=sampled_noise,
-            text_prompts=prompts,
-            return_latents=True,
-            initial_latent=initial_latent
-        )
-        video = 255.0 * rearrange(video, 'b t c h w -> b t h w c').cpu()
-        pipeline.vae.model.clear_cache()
-        write_video(output_path, video[0], fps=16)
+            set_seed(sample_seed)
+            sampled_noise = torch.randn(
+                [1, args.num_output_frames, 16, 60, 104], device=device, dtype=torch.bfloat16
+            )
+
+            video, latents = pipeline.inference(
+                noise=sampled_noise,
+                text_prompts=prompts,
+                return_latents=True,
+                initial_latent=None
+            )
+            video = 255.0 * rearrange(video, 'b t c h w -> b t h w c').cpu()
+            pipeline.vae.model.clear_cache()
+            write_video(output_path, video[0], fps=16)
+            print(f"Saved sample {sample_idx} (seed={sample_seed})")
 
        
